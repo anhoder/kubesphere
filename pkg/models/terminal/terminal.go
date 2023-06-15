@@ -44,6 +44,10 @@ import (
 const (
 	// Time allowed to write a message to the peer.
 	writeWait = 10 * time.Second
+	// Time allowed to read the next pong message from the peer.
+	pongWait = 50 * time.Second
+	// Send pings to peer with this period. Must be less than pongWait.
+	pingPeriod = pongWait * 9 / 10
 	// ctrl+d to close terminal.
 	endOfTransmission = "\u0004"
 )
@@ -57,8 +61,9 @@ type PtyHandler interface {
 
 // TerminalSession implements PtyHandler (using a SockJS connection)
 type TerminalSession struct {
-	conn     *websocket.Conn
-	sizeChan chan remotecommand.TerminalSize
+	conn       *websocket.Conn
+	sizeChan   chan remotecommand.TerminalSize
+	cancelFunc context.CancelFunc
 }
 
 var (
@@ -143,11 +148,21 @@ func (t TerminalSession) Toast(p string) error {
 	return nil
 }
 
+func (t TerminalSession) pingPeer(_ context.Context) {
+	_ = t.conn.SetWriteDeadline(time.Now().Add(writeWait))
+	if err := t.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+		klog.Warningf("failed to send pings, err: %+v", err)
+	}
+}
+
 // Close shuts down the SockJS connection and sends the status code and reason to the client
 // Can happen if the process exits or if there is an error starting up the process
 // For now the status code is unused and reason is shown to the user (unless "")
 func (t TerminalSession) Close(status uint32, reason string) {
 	klog.Warning(status, reason)
+	if t.cancelFunc != nil {
+		t.cancelFunc()
+	}
 	close(t.sizeChan)
 	t.conn.Close()
 }
@@ -330,7 +345,13 @@ func (t *terminaler) HandleSession(shell, namespace, podName, containerName stri
 	var err error
 	validShells := []string{"bash", "sh"}
 
-	session := &TerminalSession{conn: conn, sizeChan: make(chan remotecommand.TerminalSize)}
+	ctx, cancel := context.WithCancel(context.Background())
+	session := &TerminalSession{conn: conn, sizeChan: make(chan remotecommand.TerminalSize), cancelFunc: cancel}
+
+	// Heartbeat detection
+	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+	conn.SetPongHandler(func(string) error { return conn.SetReadDeadline(time.Now().Add(pongWait)) })
+	go wait.UntilWithContext(ctx, session.pingPeer, pingPeriod)
 
 	if isValidShell(validShells, shell) {
 		cmd := []string{shell}
